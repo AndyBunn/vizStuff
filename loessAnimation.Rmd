@@ -1,0 +1,274 @@
+---
+title: "Loess smoothing animation"
+author: "Andy Bunn"
+date: "11/11/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Built with `R` version `r getRversion()` and `RStudio` version `r rstudioapi::versionInfo()$version` with the current CRAN versions of all packages as of `r Sys.Date()`. 
+
+## Packages
+I use `tidyverse` stuff below, `gganimate` to do the actual animation and I'm grabbing data from `dplR`.
+
+```{r, message=FALSE}
+library(tidyverse)
+library(broom)
+library(gganimate)
+library(dplR)
+```
+
+## Data
+I'll grab a series out of the classic Schulman doug fir data. Study `co021` on the ITRDB which is onboard in `dplR`. I'll make that a `tibble` which is a gussied up `data.frame` for those not in the know. 
+
+```{r}
+data(co021)
+core1 <- tibble(yr = time(co021), mm = co021$`641114`)
+core1 <- core1 %>% drop_na()
+core1
+```
+
+## Model fitting
+We will fit a loess model of ring wing width as a function of time. Note this is a first-order polynomial (`degree = 1`) while the default is to use a 2nd-order polynomial. The argument `span` gives the percentage of the points used. Since there are `r nrow(core1)` this corresponds to  `r floor(nrow(core1) * 0.1)` years being used at each fit. 
+
+```{r}
+loessModel <- loess(formula = mm ~ yr, data = core1, degree = 1, span = 0.1)
+loessFit <- augment(loessModel)
+```
+
+Because the output object from `loessModel` model is, well, yucky, I used `augment` from `broom` to put it in a nicer format. 
+
+Here is a plot of the fit.
+
+```{r}
+# I'll use this theme throughout
+theme_set(theme_bw(base_size = 14))
+loessFit %>% ggplot() +
+  geom_line(mapping = aes(x = yr, y = mm), color="grey") +
+  geom_line(mapping = aes(x = yr, y = .fitted), color = "black") +
+  labs(x="Year", y = "Ring Width (mm)", 
+       subtitle = "Sample 641114 Schulman Old Tree No. 1, Mesa Verde")
+```
+
+```{r, eval=FALSE, echo=FALSE}
+# show how similar to nyr spline
+foo <- core1 
+foo$sm <- ffcsaps(y=core1$mm,nyrs=69)
+ggplot(data=foo) + geom_line(aes(yr,mm),col="grey") + geom_line(aes(yr,sm))
+```
+
+## Loess fitting by hand
+Ok. The loess model was fit. Now, let's recreate that fit by hand. Here is the process:
+1. Expand the data in `core1` to include all combinations of years in `core1` This is a pretty big expansion in terms of the number of rows -- the number of years squared (`r nrow(core1)^2`). 
+
+2. Create new column that is the absolute distance from the center year.
+
+3. Remove all rows that are further away than the span we selected (10%). This shrinks the data down to a more manageable size here and will be the number of points used in each local regression.
+
+4. Calculate a weight for each local regression using tricubic weighting. See `?loess` for details.
+
+```{r}
+loessByHand <- core1 %>%
+  crossing(centerYear = core1$yr) %>% group_by(centerYear) %>%
+  mutate(distToYear = abs(yr - centerYear)) %>%
+  filter(rank(distToYear) / n() <= 0.1) %>%
+  mutate(localWeight = (1 - (distToYear / max(distToYear)) ^ 3) ^ 3)
+```
+
+Let's a get a feel for what `loessByHand` looks like by selecting a year.
+
+```{r}
+loessByHand %>% filter(centerYear == 1500)
+```
+
+This shows you the data that will be used in the local fitting for the year 1500. The local regression will use a window of 69 years (34 years behind and 34 years ahead) to predict the value at 1500. Why 69 and 34? Because 69 is 10% of the number of years and 34 is the center of 69. Here is what the weights look like for that model as a function of distance.
+
+```{r}
+loessByHand  %>% filter(centerYear == 1500) %>% 
+  ggplot(mapping = aes(x=distToYear, y=localWeight)) + geom_line()
+```
+
+And time.
+```{r}
+loessByHand  %>% filter(centerYear == 1500) %>% 
+  ggplot(mapping = aes(x=yr,y=localWeight)) + geom_line()
+```
+
+So the prediction for the year 1500 will be done using `lm` with weights as shown above.
+
+```{r}
+lm1500 <- lm(mm~yr,data = loessByHand, subset = centerYear == 1500, weights = localWeight)
+lm1500
+```
+
+And we can predict the ring width at the year 1500 using those coefficients:
+
+$$\hat{y} = `r coefficients(lm1500)[1]`  
+`r coefficients(lm1500)[2]` \times 1500 
+= `r coefficients(lm1500)[1] + coefficients(lm1500)[2] * 1500`$$
+
+
+Armed with that knowledge we can now run this model for every year. I find this syntax painful because I don't use `broom` a lot but here is the idea:
+
+1. We fit a linear model, like above, for each year using `do` and we `tidy` up the output of the model so we have easy access to the coefficients. This is conceptually like writing a loop.
+
+2. We take that data which is in long format and wrangle it to make it wide in order to predict growth (mm) in each year.
+
+```{r}
+preds <- loessByHand %>% do(tidy(lm(mm~yr,weight=localWeight, data = .))) %>% 
+  select(centerYear, estimate, term) %>% 
+  pivot_wider(names_from = term, values_from = estimate) %>%
+  summarise(yhat = `(Intercept)` + centerYear * yr)
+```
+
+I feel like there should be an easier syntax for that. But my next attempt, while doing the same thing is even more opaque. But that's my problem I fear, not yours.
+
+```{r}
+preds <- loessByHand %>% do(mod = lm(mm~yr,weight=localWeight, data = .)) %>% 
+  do(tibble(centerYear = .$centerYear,
+            yhat = predict(.$mod, newdata = data.frame(yr=.$centerYear))))
+```
+
+Let's regroup. We've made two useful objects. The first is `loessByHand` which gives us the moving variables that we need to run a local regression for each year and the weights for that regression.
+
+We then used that information to run each regression and predict growth in each year. Those data are in the object `preds`. With that we can make an animation.
+
+# First animation
+We start by making a `ggplot` object and then animating it.
+
+```{r first animation}
+p1 <- ggplot() +
+  geom_line(data = loessFit, mapping = aes(x = yr, y = mm), color = "grey") +
+  geom_line(data = loessFit, mapping = aes(x = yr, y = .fitted), color = "black") + 
+  geom_point(data = loessByHand, mapping = aes(x = yr, y = mm, size=localWeight),
+             color = "Light Coral", alpha = 0.75, shape = 21) +
+  geom_smooth(data = loessByHand, 
+              mapping = aes(x = yr, y = mm, group = centerYear, weight = localWeight), 
+              method = "lm", se = FALSE, color="blue") +
+  geom_point(data = preds, mapping = aes(x=centerYear, y=yhat),color="Dark Red", size=2) +
+  # this layer is continuously built via shadow_mark
+  geom_point(data = preds, mapping = aes(x=centerYear, y=yhat), color="Dark Red", shape=20) +
+  labs(x="Year", y = "Ring Width (mm)", 
+       subtitle = "Sample 641114 Schulman Old Tree No. 1, Mesa Verde") +
+  guides(size = FALSE) +
+  scale_size_continuous(range = c(0,2))
+```
+
+You could plot `p1` at this point but it's a mess since all the layers are jumbled together. Here is the animation where we transition on each year.
+
+```{r}
+p2 <- p1 + transition_time(centerYear) + shadow_mark(exclude_layer = c(1:5))
+animate(p2, duration = 20, detail = 5, 
+        height = 6, width = 6, units = "in", res=250,
+        renderer = ffmpeg_renderer(format = "webm"))
+```
+
+You can walk through the code at your leisure but note that there are six layers. The two are  the time series and the fitted loess model over the whole time series from `loessFit`. The next two layers use `loessByHand` to show the points used in each year's model fit and the regression line. The final two show the predictions we made with `preds`. After that we are just adding layers, sizing points, omitting a legend, and scaling the points. 
+
+For the animation we use the `centerYear` column in `loessByHand` and in `preds` to govern the transitions between frames. The only mildly tricky bit is that we are letting the predictions from the last layer leave a shadow behind so we can see the fit being built. We use `shadow_mark` for that and apply it to the last layer only.
+
+Note that I'm making a video with my call to `animate` rather than a GIF. Why? Read on.
+
+## Getting the animation files out
+The default format in `gganimate` is output a GIF. When I do that for these animations and knit an html doc, the file is an unwieldy size (13 MB). So here, I'm outputting video files. This makes the kintted document more manageable (~2 MB) but requires `ffmpeg` on the machine.  
+
+I'm still learning about all this kind of stuff and I'm not real interested in codecs, bitrates, and so on. Look at the [gganimate](https://https://gganimate.com/index.html#where-is-my-animationl) page for info on rendering to different formats. There are loads of ways to customize the animation in terms of format, looping, pausing, and so on. E.g.,
+
+```{r, eval = FALSE}
+# Default is a GIF
+animate(p2, duration = 20, detail = 5, 
+        height = 6, width = 6, units = "in", res=250)
+# This will write a mp4
+animate(p2, duration = 20, detail = 5, 
+        height = 6, width = 6, units = "in", res=250, 
+        renderer = av_renderer("treeRing1Span.mp4"))
+```
+
+
+## Making the plot I wanted
+What I have above was a good start and I learned quite a bit about loess and an algorithm, `broom`, and `gganimate`. But that wasn't the plot I wanted. I really wanted to see how the fit changes with the `span` argument and especially get a visualization of the which points are used in the fitting. So without a lot of commentary, I'll repeat what is above but this time repeat over four different spans.
+
+```{r}
+spansToUse <- c(0.1, 0.2, 0.4, 0.8)
+
+loessFit <- tibble(span = spansToUse) %>%
+  group_by(span) %>%
+  do(augment(loess(mm ~ yr, data=core1, degree = 1, span = .$span)))
+
+loessByHand <- core1 %>%
+  crossing(span = spansToUse, centerYear = core1$yr) %>%
+  group_by(span, centerYear) %>%
+  mutate(distToYear = abs(yr - centerYear)) %>%
+  filter(rank(distToYear) / n() <= span) %>%
+  mutate(localWeight = (1 - (distToYear / max(distToYear)) ^ 3) ^ 3)
+
+preds <- loessByHand %>% do(tidy(lm(mm~yr,weight=localWeight, data = .))) %>% 
+  select(span, centerYear, estimate, term) %>% 
+  pivot_wider(names_from = term, values_from = estimate) %>%
+  summarise(yhat = `(Intercept)` + centerYear * yr)
+```
+
+Now span is added as a grouping variable. And we can do the same thing as above.
+
+```{r}
+loessFit %>% ggplot() +
+  geom_line(mapping = aes(x = yr, y = mm), color="grey") +
+  geom_line(mapping = aes(x = yr, y = .fitted), color = "black") +
+  labs(x="Year", y = "Ring Width (mm)", 
+       subtitle = "Sample 641114 Schulman Old Tree No. 1, Mesa Verde") +
+  facet_wrap(span~.,labeller=as_labeller(c('0.1'="Span=10%",
+                                           '0.2'="Span=20%",
+                                           '0.4'="Span=40%",
+                                           '0.8'="Span=80%")))
+```
+
+
+```{r}
+loessByHand <- loessByHand %>% 
+  mutate(weightFactor = cut(localWeight, breaks = c(0,0.1,0.5,0.9,1),include.lowest = TRUE))
+p1 <- ggplot() +
+  geom_line(data = loessFit, mapping = aes(x = yr, y = mm), color = "grey") +
+  geom_line(data = loessFit, mapping = aes(x = yr, y = .fitted), color = "black") + 
+  geom_point(data = loessByHand, mapping = aes(x = yr, y = mm, size=weightFactor),
+             color = "Light Coral", alpha = 0.75, shape = 21) +
+  geom_smooth(data = loessByHand, 
+              mapping = aes(x = yr, y = mm, group = centerYear, weight = localWeight), 
+              method = "lm", se = FALSE, color="blue") +
+  geom_point(data = preds, mapping = aes(x=centerYear, y=yhat),color="Dark Red", size=2) +
+  # this layer is continuously built via shadow_mark
+  geom_point(data = preds, mapping = aes(x=centerYear, y=yhat), color="Dark Red", shape=20) +
+  labs(x="Year", y = "Ring Width (mm)", 
+       subtitle = "Sample 641114 Schulman Old Tree No. 1, Mesa Verde") +
+  scale_size_manual(values = c(0,0.25,0.5,2)) + 
+  guides(size = FALSE) +
+  facet_wrap(span~.,labeller=as_labeller(c('0.1'="Span=10%",
+                                           '0.2'="Span=20%",
+                                           '0.4'="Span=40%",
+                                           '0.8'="Span=80%")))
+```
+
+
+In the final animation we can see how the span affects the fit and we can also see more clearly how the points are weighted in the regression (easier to see at the longer spans). I added a scaling scheme to the weights to emphasize that which is important for understanding the algorithm.
+
+```{r final animation}
+p2 <- p1 + transition_time(centerYear) + shadow_mark(exclude_layer = c(1:5))
+animate(p2, duration = 20, detail = 5, 
+        height = 6, width = 6, units = "in", res=250,
+        renderer = ffmpeg_renderer(format = "webm"))
+```
+
+Beware that these animations take awhile to render. Minutes, not hours. But it still seems like a long time these days.
+
+
+```{r, echo=FALSE, eval=FALSE}
+foo <- tibble(x=1:100, y = rnorm(100), weight=runif(100))
+foo <- foo %>% mutate(weightFactor = cut(weight, breaks = c(0,0.1,0.5,0.9,1)))
+nlevels(foo$weightFactor)
+#levels(foo$weightFactor) <- c("small","medium","large","vlarge")
+
+ggplot(foo,aes(x,y,size=weightFactor)) + geom_point() + 
+    scale_size_manual(values = c(0,0.5,1,3))
+```
